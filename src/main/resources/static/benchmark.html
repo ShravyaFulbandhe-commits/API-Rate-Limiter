@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rate limiter benchmark</title>
+<style>
+  :root { --bg:#fafaf8; --fg:#1f2328; --muted:#6b7280; --card:#ffffff; --line:#e3e3df; --accent:#2563eb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16181d; --fg:#e6e6e6; --muted:#9aa0aa; --card:#1e2128; --line:#32363f; --accent:#60a5fa; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px; background:var(--bg); color:var(--fg);
+         font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  main { max-width: 980px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin: 0 0 20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  .card h2 { font-size:15px; margin:0 0 2px; }
+  .card p { margin:0 0 10px; color:var(--muted); font-size:13px; }
+  form { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; }
+  label { display:flex; flex-direction:column; font-size:12px; color:var(--muted); gap:3px; }
+  input { padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); width:120px; }
+  input.wide { width:190px; }
+  button { padding:8px 16px; border:0; border-radius:6px; background:var(--accent); color:#fff; font-weight:600; cursor:pointer; }
+  canvas { width:100%; height:260px; display:block; }
+  .legend { display:flex; flex-wrap:wrap; gap:14px; font-size:13px; margin-top:8px; }
+  .legend span::before { content:""; display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:6px; background:var(--c); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:right; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th:first-child, td:first-child { text-align:left; }
+  td.bad { color:#e24a33; font-weight:600; }
+  #err { color:#e24a33; margin-top:8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Same traffic, four algorithms</h1>
+  <p class="sub">One identical arrival schedule is replayed through every limiter on a virtual clock, so the comparison is deterministic.</p>
+
+  <div class="card">
+    <form id="f">
+      <label>Limit<input name="limit" type="number" value="100" min="1"></label>
+      <label>Window (ms)<input name="windowMs" type="number" value="10000" min="1"></label>
+      <label>Duration (ms)<input name="durationMs" type="number" value="30000" min="1000" max="300000"></label>
+      <label>Steady req/s<input name="steadyRps" type="number" value="5" min="0"></label>
+      <label>Burst size<input name="burstSize" type="number" value="100" min="0"></label>
+      <label>Burst times (ms)<input class="wide" name="burstTimes" value="9900,10100,20000"></label>
+      <button type="submit">Run</button>
+    </form>
+    <div id="err"></div>
+  </div>
+
+  <div class="card">
+    <h2>Peak admitted in any window</h2>
+    <p>The strictest test: the most requests let through inside <i>any</i> span of one window length. Dashed line = configured limit.</p>
+    <canvas id="c-max"></canvas>
+  </div>
+
+  <div class="card">
+    <h2>Admitted per second</h2>
+    <p>Grey = traffic offered. Notice how fixed window lets both boundary bursts through almost untouched.</p>
+    <canvas id="c-line"></canvas>
+    <div class="legend" id="legend"></div>
+  </div>
+
+  <div class="card">
+    <h2>Totals</h2>
+    <table id="tbl"></table>
+  </div>
+</main>
+
+<script>
+const COLORS = {
+  FIXED_WINDOW: '#e24a33',
+  SLIDING_WINDOW_LOG: '#348abd',
+  SLIDING_WINDOW_COUNTER: '#8e6fd1',
+  TOKEN_BUCKET: '#2e9e5b'
+};
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+function setup(canvas) {
+  const r = canvas.getBoundingClientRect(), d = window.devicePixelRatio || 1;
+  canvas.width = r.width * d; canvas.height = r.height * d;
+  const c = canvas.getContext('2d'); c.scale(d, d);
+  return { c, w: r.width, h: r.height };
+}
+
+function niceMax(v) {
+  const p = Math.pow(10, Math.floor(Math.log10(Math.max(v, 1))));
+  return Math.ceil(v / p) * p;
+}
+
+function drawAxes(c, w, h, pad, max, fg, muted, line) {
+  c.font = '11px system-ui'; c.fillStyle = muted; c.strokeStyle = line; c.textAlign = 'right';
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + (h - pad.t - pad.b) * (1 - i / 4);
+    c.beginPath(); c.moveTo(pad.l, y); c.lineTo(w - pad.r, y); c.stroke();
+    c.fillText(Math.round(max * i / 4), pad.l - 6, y + 4);
+  }
+}
+
+function barChart(canvas, labels, values, colors, refLine) {
+  const { c, w, h } = setup(canvas);
+  const fg = css('--fg'), muted = css('--muted'), line = css('--line');
+  const pad = { l: 44, r: 16, t: 14, b: 34 };
+  const max = niceMax(Math.max(...values, refLine) * 1.1);
+  drawAxes(c, w, h, pad, max, fg, muted, line);
+  const plotW = w - pad.l - pad.r, slot = plotW / values.length, bw = Math.min(70, slot * 0.55);
+  const y = v => pad.t + (h - pad.t - pad.b) * (1 - v / max);
+  values.forEach((v, i) => {
+    const x = pad.l + slot * i + (slot - bw) / 2;
+    c.fillStyle = colors[i]; c.fillRect(x, y(v), bw, y(0) - y(v));
+    c.fillStyle = fg; c.textAlign = 'center'; c.font = '600 12px system-ui';
+    c.fillText(v, x + bw / 2, y(v) - 5);
+    c.fillStyle = muted; c.font = '11px system-ui';
+    c.fillText(labels[i], x + bw / 2, h - 12);
+  });
+  c.setLineDash([6, 4]); c.strokeStyle = fg; c.lineWidth = 1.5;
+  c.beginPath(); c.moveTo(pad.l, y(refLine)); c.lineTo(w - pad.r, y(refLine)); c.stroke();
+  c.setLineDash([]);
+}
+
+function lineChart(canvas, offered, series) {
+  const { c, w, h } = setup(canvas);
+  const fg = css('--fg'), muted = css('--muted'), line = css('--line');
+  const pad = { l: 44, r: 16, t: 14, b: 30 };
+  const n = offered.length;
+  const max = niceMax(Math.max(...offered, ...series.flatMap(s => s.data)) * 1.08);
+  drawAxes(c, w, h, pad, max, fg, muted, line);
+  const x = i => pad.l + (w - pad.l - pad.r) * (n === 1 ? 0.5 : i / (n - 1));
+  const y = v => pad.t + (h - pad.t - pad.b) * (1 - v / max);
+  c.textAlign = 'center'; c.fillStyle = muted; c.font = '11px system-ui';
+  const step = Math.max(1, Math.ceil(n / 10));
+  for (let i = 0; i < n; i += step) c.fillText(i + 's', x(i), h - 10);
+
+  const path = (data, color, width, dash) => {
+    c.beginPath(); c.strokeStyle = color; c.lineWidth = width; c.setLineDash(dash || []);
+    data.forEach((v, i) => i ? c.lineTo(x(i), y(v)) : c.moveTo(x(i), y(v)));
+    c.stroke(); c.setLineDash([]);
+  };
+  path(offered, muted, 1.5, [3, 3]);
+  series.forEach(s => path(s.data, s.color, 2.2));
+}
+
+async function run(params) {
+  const err = document.getElementById('err'); err.style.color = 'var(--muted)'; err.textContent = 'Running…';
+  const res = await fetch('/benchmark/run?' + new URLSearchParams(params));
+  if (!res.ok) { err.style.color = '#e24a33'; err.textContent = 'Request failed: ' + res.status; return; }
+  const data = await res.json();
+  const labels = data.results.map(r => r.algorithm.replaceAll('_', ' ').toLowerCase());
+  const colors = data.results.map(r => COLORS[r.algorithm]);
+
+  barChart(document.getElementById('c-max'), labels, data.results.map(r => r.maxInAnyWindow), colors, data.scenario.limit);
+  lineChart(document.getElementById('c-line'), data.offeredPerSecond,
+            data.results.map(r => ({ data: r.allowedPerSecond, color: COLORS[r.algorithm] })));
+
+  document.getElementById('legend').innerHTML = data.results
+    .map(r => `<span style="--c:${COLORS[r.algorithm]}">${r.algorithm.replaceAll('_', ' ').toLowerCase()}</span>`).join('');
+
+  const rows = data.results.map(r => `<tr><td>${r.algorithm}</td><td>${r.offered}</td><td>${r.allowed}</td>
+    <td>${r.rejected}</td><td class="${r.maxInAnyWindow > data.scenario.limit ? 'bad' : ''}">${r.maxInAnyWindow}</td></tr>`).join('');
+  document.getElementById('tbl').innerHTML =
+    '<tr><th>Algorithm</th><th>Offered</th><th>Allowed</th><th>Rejected</th><th>Peak in any window</th></tr>' + rows;
+  err.textContent = 'Updated at ' + new Date().toLocaleTimeString();
+}
+
+document.getElementById('f').addEventListener('submit', e => {
+  e.preventDefault();
+  run(Object.fromEntries(new FormData(e.target)));
+});
+window.addEventListener('resize', () => document.getElementById('f').requestSubmit());
+run({});
+</script>
+</body>
+</html>
